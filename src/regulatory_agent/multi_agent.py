@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from operator import add
 from pathlib import Path
 import re
@@ -26,6 +27,9 @@ from regulatory_agent.routing import (
 )
 from regulatory_agent.specialist_agent import SpecialistAgentState
 from regulatory_agent.web_research import WebResearchResult
+
+
+trajectory_logger = logging.getLogger("regulatory_agent.trajectory")
 
 
 _CHECKPOINT_ALLOWED_TYPES = [
@@ -404,7 +408,8 @@ FINAL_ANSWER_PROMPT = ChatPromptTemplate.from_messages(
 - Do not invent facts, CFR paragraphs, document titles, dates, or URLs.
 - Preserve material conditions, exceptions, uncertainty, and source conflicts.
 - Clearly distinguish binding requirements from guidance and web context.
-- Answer in the same language as the user's question when practical.
+- Write the entire answer in the required response language shown below.
+- Do not switch languages merely because source material is written in English.
 - Omit any point that cannot be supported by a supplied source.
 
 ## Citation rules
@@ -425,6 +430,9 @@ Return the required FinalAnswerDraft structured output.""",
             "human",
             """## User question
 {question}
+
+## Required response language
+{response_language}
 
 ## Selected agent summaries
 {agent_summaries}
@@ -457,7 +465,8 @@ all useful, supported content.
 - Remove or narrow unsupported and overstated claims.
 - If an identified gap cannot be resolved from the supplied sources, state the
   limitation rather than filling it with outside knowledge.
-- Answer in the same language as the original question when practical.
+- Write the entire revised answer in the required response language shown below.
+- Do not switch languages merely because source material is written in English.
 
 ## Citation rules
 - Cite claims only with the supplied request-local markers, such as [[S1]].
@@ -472,6 +481,9 @@ Return the required FinalAnswerDraft structured output.""",
             "human",
             """## Original question
 {question}
+
+## Required response language
+{response_language}
 
 ## Previous validated answer
 {previous_answer}
@@ -573,6 +585,12 @@ def _validation_failure_answer(question: str) -> str:
     if re.search(r"[가-힣]", question):
         return "최종 답변의 인용을 수집된 근거와 일치시키지 못해 답변을 반환하지 않았습니다."
     return "The final answer was not returned because its citations failed validation."
+
+
+def _response_language(question: str) -> str:
+    """Return the MVP's deterministic Korean/English response language."""
+
+    return "Korean" if re.search(r"[가-힣]", question) else "English"
 
 
 def _render_source(source: SynthesisSource) -> str:
@@ -1018,6 +1036,7 @@ class RegulatoryMultiAgent:
         prompt = FINAL_ANSWER_PROMPT.invoke(
             {
                 "question": state["question"],
+                "response_language": _response_language(state["question"]),
                 "agent_summaries": summaries or "None",
                 "sources": _render_sources(sources),
             }
@@ -1435,6 +1454,7 @@ class RegulatoryMultiAgent:
         prompt = FINAL_ANSWER_PROMPT.invoke(
             {
                 "question": state["question"],
+                "response_language": _response_language(state["question"]),
                 "agent_summaries": summaries,
                 "sources": _render_sources(sources),
             }
@@ -1507,6 +1527,7 @@ class RegulatoryMultiAgent:
         prompt = REVISION_PROMPT.invoke(
             {
                 "question": state["question"],
+                "response_language": _response_language(state["question"]),
                 "previous_answer": previous_answer,
                 "revision_feedback": revision_feedback,
                 "unsupported_claims": (
@@ -1976,7 +1997,7 @@ class RegulatoryMultiAgent:
             raise ValueError("question must not be empty")
         selected_thread_id = thread_id or str(uuid4())
         config = {"configurable": {"thread_id": selected_thread_id}}
-        state = self.graph.invoke(
+        state = self._run_with_trajectory(
             {
                 "question": question,
                 "contributions": [],
@@ -1991,6 +2012,8 @@ class RegulatoryMultiAgent:
                 "evaluation_history": [],
             },
             config=config,
+            thread_id=selected_thread_id,
+            phase="question",
         )
         return self._result_from_state(state, thread_id=selected_thread_id)
 
@@ -2018,11 +2041,101 @@ class RegulatoryMultiAgent:
             feedback=feedback,
         )
         config = {"configurable": {"thread_id": thread_id}}
-        state = self.graph.invoke(
+        state = self._run_with_trajectory(
             Command(resume=response.model_dump()),
             config=config,
+            thread_id=thread_id,
+            phase=f"human_review:{selected_action}",
         )
         return self._result_from_state(state, thread_id=thread_id)
+
+    def _run_with_trajectory(
+        self,
+        graph_input: dict[str, Any] | Command,
+        *,
+        config: dict[str, Any],
+        thread_id: str,
+        phase: str,
+    ) -> dict[str, Any]:
+        """Execute once while emitting the actual top-level node trajectory."""
+
+        trajectory_logger.info("run=%s phase=%s event=start", thread_id, phase)
+        step = 0
+        for event in self.graph.stream(
+            graph_input,
+            config=config,
+            stream_mode="updates",
+        ):
+            for node, update in event.items():
+                if node == "__interrupt__":
+                    continue
+                step += 1
+                detail = self._trajectory_detail(update)
+                trajectory_logger.info(
+                    "run=%s phase=%s step=%02d node=%s%s",
+                    thread_id,
+                    phase,
+                    step,
+                    node,
+                    f" {detail}" if detail else "",
+                )
+
+        snapshot = self.graph.get_state(config)
+        state = dict(snapshot.values)
+        if snapshot.interrupts:
+            state["__interrupt__"] = list(snapshot.interrupts)
+            termination = "awaiting_human_review"
+        else:
+            termination = state.get("termination_reason", "unknown")
+        trajectory_logger.info(
+            "run=%s phase=%s event=end termination=%s",
+            thread_id,
+            phase,
+            termination,
+        )
+        return state
+
+    @staticmethod
+    def _trajectory_detail(update: Any) -> str:
+        """Render compact, non-sensitive routing diagnostics for one node update."""
+
+        if not isinstance(update, dict):
+            return ""
+        details: list[str] = []
+        decision = update.get("decision")
+        if decision is not None:
+            routes = ",".join(choice.target for choice in decision.routes)
+            details.append(f"routes={routes or 'none'}")
+        contributions = update.get("contributions") or []
+        if contributions:
+            details.append(
+                "contributions="
+                + ",".join(
+                    f"{item.target}:{'ok' if item.success else 'failed'}"
+                    f"({len(item.sources)})"
+                    for item in contributions
+                )
+            )
+        evaluation = update.get("evaluation")
+        if evaluation is not None:
+            details.append(f"decision={evaluation.decision}")
+            details.append(f"score={evaluation.total_score}/60")
+        history = update.get("evaluation_history") or []
+        if history:
+            details.append(f"outcome={history[-1].outcome}")
+        plan = update.get("research_retry_plan")
+        if plan is not None:
+            details.append(f"planned_queries={len(plan.queries)}")
+        executions = update.get("research_retry_executions") or []
+        if executions:
+            successful = sum(item.success for item in executions)
+            details.append(f"research={successful}/{len(executions)}")
+        validation = update.get("validation")
+        if validation is not None:
+            details.append(f"citations_valid={validation.valid}")
+        if update.get("termination_reason"):
+            details.append(f"termination={update['termination_reason']}")
+        return " ".join(details)
 
     def inspect_thread(self, *, thread_id: str) -> PersistedThreadSnapshot | None:
         """Read the latest checkpoint without advancing or replaying the graph."""

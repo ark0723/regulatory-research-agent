@@ -13,6 +13,7 @@ from regulatory_agent.multi_agent import (
     SynthesisValidationResult,
     SynthesisSource,
     TargetedResearchQuery,
+    _response_language,
     merge_synthesis_sources,
     validate_research_retry_plan,
     validate_and_render_synthesis,
@@ -198,11 +199,36 @@ def build_agent(
 
 
 class MultiAgentTests(unittest.TestCase):
+    def test_final_answer_language_follows_the_question(self):
+        self.assertEqual("Korean", _response_language("연구 참여 동의 요건은 무엇인가요?"))
+        self.assertEqual("English", _response_language("What are the consent requirements?"))
+
     def test_prompt_has_explicit_structured_inputs(self):
         self.assertEqual(
-            {"agent_summaries", "question", "sources"},
+            {"agent_summaries", "question", "response_language", "sources"},
             set(FINAL_ANSWER_PROMPT.input_variables),
         )
+
+    def test_trajectory_reports_actual_nodes_and_pass_outcome(self):
+        agent, _, _, _, _ = build_agent(
+            targets=("regulation",),
+            drafts=[
+                FinalAnswerDraft(answer="Rule. [[S1]]", cited_source_ids=["S1"])
+            ],
+            evaluator=FakeEvaluator(evaluation=passing_evaluation()),
+        )
+
+        with self.assertLogs("regulatory_agent.trajectory", level="INFO") as logs:
+            result = agent.ask("What is required?", thread_id="trajectory-test")
+
+        output = "\n".join(logs.output)
+        self.assertEqual("answered", result.termination_reason)
+        self.assertIn("node=route_question routes=regulation", output)
+        self.assertIn("node=regulation_agent contributions=regulation:ok(1)", output)
+        self.assertIn("node=generate_answer", output)
+        self.assertIn("node=evaluate_answer decision=pass score=52/60", output)
+        self.assertIn("node=route_after_evaluation outcome=success", output)
+        self.assertIn("event=end termination=answered", output)
 
     def test_selected_nodes_merge_once_and_render_source_specific_citations(self):
         agent, llm, regulation, guidance, web = build_agent(

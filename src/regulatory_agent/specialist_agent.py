@@ -45,6 +45,7 @@ agent.save_mermaid(
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import re
 from typing import Any, Callable, Literal, TypedDict
@@ -54,6 +55,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import BaseTool, tool
 from langchain_postgres import PGVector
 from langgraph.graph import END, START, StateGraph
+from langgraph.config import get_config
 from pydantic import BaseModel, Field
 
 from regulatory_agent.citations import (
@@ -76,6 +78,9 @@ from regulatory_agent.tools import (
     RegulatorySearchResult,
     retrieve_rerank_expand,
 )
+
+
+trajectory_logger = logging.getLogger("regulatory_agent.trajectory")
 
 
 class ExtractedEvidence(BaseModel):
@@ -245,7 +250,8 @@ evidence referenced by those findings.
 - Do not infer legal consequences beyond the supplied evidence.
 - Include conditions, exceptions, or limitations only when supported.
 - Do not include unrelated retrieved sources.
-- Answer in the same language as the user's question when practical.
+- Write the entire answer in the required response language shown below.
+- Do not switch languages merely because source material is written in English.
 
 ## Citation rules
 - Use only request-local inline markers such as [[E1]].
@@ -266,6 +272,9 @@ Return the required GeneratedAnswer structured output.""",
             "human",
             """## User question
 {question}
+
+## Required response language
+{response_language}
 
 ## Validated extracted findings
 {extracted_findings}
@@ -296,6 +305,10 @@ def _citation_failure_answer(question: str) -> str:
     if re.search(r"[가-힣]", question):
         return "생성된 답변의 인용을 검색 근거와 일치시키지 못해 답변을 반환하지 않았습니다."
     return "The generated answer was not returned because its citations failed validation."
+
+
+def _response_language(question: str) -> str:
+    return "Korean" if re.search(r"[가-힣]", question) else "English"
 
 
 def _normalized_citation(value: str) -> str:
@@ -615,6 +628,7 @@ class CorrectiveRegulatorySpecialist:
         prompt = ANSWER_PROMPT.invoke(
             {
                 "question": state["question"],
+                "response_language": _response_language(state["question"]),
                 "extracted_findings": findings,
                 "citation_catalog": render_citation_catalog(answer_catalog),
                 "evidence_warnings": (
@@ -668,15 +682,82 @@ class CorrectiveRegulatorySpecialist:
     def ask(self, question: str) -> SpecialistAgentState:
         if not question.strip():
             raise ValueError("question must not be empty")
+        try:
+            config = get_config()
+            run_id = str(config.get("configurable", {}).get("thread_id", "standalone"))
+        except RuntimeError:
+            run_id = "standalone"
 
-        return self.graph.invoke(
+        phase = f"specialist:{self.document_type}"
+        trajectory_logger.info("run=%s phase=%s event=start", run_id, phase)
+        final_state: SpecialistAgentState | None = None
+        step = 0
+        for mode, payload in self.graph.stream(
             {
                 "question": question,
                 "active_query": question,
                 "query_history": [question],
                 "rewrite_count": 0,
-            }
+            },
+            stream_mode=["updates", "values"],
+        ):
+            if mode == "values":
+                final_state = payload
+                continue
+            for node, update in payload.items():
+                step += 1
+                detail = self._trajectory_detail(update)
+                trajectory_logger.info(
+                    "run=%s phase=%s step=%02d node=%s%s",
+                    run_id,
+                    phase,
+                    step,
+                    node,
+                    f" {detail}" if detail else "",
+                )
+        if final_state is None:
+            raise RuntimeError("specialist graph produced no final state")
+        trajectory_logger.info(
+            "run=%s phase=%s event=end termination=%s",
+            run_id,
+            phase,
+            final_state.get("termination_reason", "unknown"),
         )
+        return final_state
+
+    @staticmethod
+    def _trajectory_detail(update: Any) -> str:
+        if not isinstance(update, dict):
+            return ""
+        details: list[str] = []
+        search_result = update.get("search_result")
+        if search_result is not None:
+            diagnostics = search_result.diagnostics
+            details.extend(
+                (
+                    f"candidates={diagnostics.candidate_count}",
+                    f"parents={len(diagnostics.selected_parent_sections)}",
+                    f"evidence={len(search_result.expanded_evidence)}",
+                    f"budget_excluded={len(diagnostics.excluded_due_to_budget)}",
+                )
+            )
+        assessment = update.get("assessment")
+        if assessment is not None:
+            details.extend(
+                (
+                    f"sufficient={assessment.is_sufficient}",
+                    f"answerability={assessment.answerability_score:.2f}",
+                    f"missing={len(assessment.missing_information)}",
+                )
+            )
+        if "rewrite_count" in update:
+            details.append(f"rewrite_count={update['rewrite_count']}")
+        validation = update.get("citation_validation")
+        if validation is not None:
+            details.append(f"citations_valid={validation.valid}")
+        if update.get("termination_reason"):
+            details.append(f"termination={update['termination_reason']}")
+        return " ".join(details)
 
     def as_tool(self) -> BaseTool:
         """Expose this bounded specialist graph as a routing-layer tool."""

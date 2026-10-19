@@ -16,6 +16,7 @@ from regulatory_agent.specialist_agent import (
     ExtractedEvidence,
     QueryRewrite,
     REWRITE_PROMPT,
+    _response_language,
 )
 from regulatory_agent.tools import RegulatorySearchResult, SearchDiagnostics
 
@@ -129,6 +130,10 @@ class SearchSequence:
 
 
 class SpecialistAgentTests(unittest.TestCase):
+    def test_response_language_follows_question_without_changing_search_query(self):
+        self.assertEqual("Korean", _response_language("동의서에는 무엇이 포함되어야 하나요?"))
+        self.assertEqual("English", _response_language("What must consent contain?"))
+
     def test_prompt_templates_have_explicit_structured_inputs(self):
         self.assertEqual(
             {
@@ -157,6 +162,7 @@ class SpecialistAgentTests(unittest.TestCase):
                 "evidence_warnings",
                 "extracted_findings",
                 "question",
+                "response_language",
             },
             set(ANSWER_PROMPT.input_variables),
         )
@@ -225,6 +231,47 @@ class SpecialistAgentTests(unittest.TestCase):
             "Answer after corrective retrieval. [21 CFR § 50.25]",
             result["answer"],
         )
+
+    def test_trajectory_reports_specialist_retrieval_rewrite_and_outcome(self):
+        search = SearchSequence([search_result("partial"), search_result("complete")])
+        llm = FakeLLM(
+            assessments=[
+                insufficient_assessment("the controlling paragraph"),
+                sufficient_assessment(),
+            ],
+            rewrites=[
+                QueryRewrite(
+                    rewritten_query="21 CFR 50.25 controlling paragraph",
+                    rationale="Target the missing provision.",
+                )
+            ],
+            answers=[
+                GeneratedAnswer(
+                    answer="Grounded answer. [[E1]]",
+                    cited_evidence_ids=["E1"],
+                )
+            ],
+        )
+        agent = CorrectiveRegulatorySpecialist(
+            llm=llm,
+            document_type="regulation",
+            search=search,
+            max_rewrites=1,
+        )
+
+        with self.assertLogs("regulatory_agent.trajectory", level="INFO") as logs:
+            result = agent.ask("What is required?")
+
+        output = "\n".join(logs.output)
+        self.assertEqual("answered", result["termination_reason"])
+        self.assertIn("phase=specialist:regulation", output)
+        self.assertIn("node=retrieve candidates=1 parents=1 evidence=1", output)
+        self.assertIn(
+            "node=extract_and_evaluate sufficient=False answerability=0.20 missing=1",
+            output,
+        )
+        self.assertIn("node=rewrite_query rewrite_count=1", output)
+        self.assertIn("event=end termination=answered", output)
 
     def test_retry_limit_returns_explicit_insufficient_answer(self):
         search = SearchSequence([search_result("partial"), search_result("still partial")])

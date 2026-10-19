@@ -55,6 +55,7 @@ uv run regulatory-agent route "What are the eight basic elements of informed con
 # Run selected agents and citation-validated final synthesis:
 uv run regulatory-agent research "What are the eight basic elements of informed consent?"
 uv run regulatory-persistence setup
+uv run regulatory-web --provider groq --model <groq-model-name>
 uv run python -m unittest discover -s tests -p 'test_*.py'
 ```
 
@@ -142,6 +143,43 @@ failed runs and never trigger automatic research replay.
 Exactly-once external model/tool execution cannot be guaranteed across a
 process crash: an external call may finish before the next checkpoint. The
 reconciler therefore prefers an explicit ambiguous failure over replay.
+
+### Gradio Web MVP
+
+Initialize the persistence schemas once, then launch the local-only web app:
+
+```bash
+uv run regulatory-persistence setup
+uv run regulatory-web --provider groq --model <groq-model-name>
+```
+
+The server binds to `127.0.0.1:7860` and public sharing is disabled. It opens
+one PostgreSQL-backed `ConversationService` for the application lifetime.
+Browser sessions keep their own selected conversation and pending UI command,
+while conversation messages, run summaries, review history, and LangGraph
+checkpoints are restored from PostgreSQL. Each question creates a new isolated
+run. Do not expose the MVP on a public interface until authentication and
+authorization are implemented.
+
+The UI is English. Generated answers follow the detected question language:
+questions containing Korean text request a Korean answer; other MVP questions
+request an English answer. The terminal prints the actual top-level and
+specialist LangGraph trajectory for each run and human-review resume, for example:
+
+```text
+[trajectory] run=<run-id> phase=question step=01 node=route_question routes=regulation
+[trajectory] run=<run-id> phase=specialist:regulation step=01 node=retrieve candidates=15 parents=2 evidence=12 budget_excluded=2
+[trajectory] run=<run-id> phase=specialist:regulation step=02 node=extract_and_evaluate sufficient=True answerability=0.95 missing=0
+[trajectory] run=<run-id> phase=question step=02 node=regulation_agent contributions=regulation:ok(1)
+[trajectory] run=<run-id> phase=question step=03 node=generate_answer citations_valid=True termination=answered
+[trajectory] run=<run-id> phase=question step=04 node=evaluate_answer decision=pass score=59/60
+[trajectory] run=<run-id> phase=question step=05 node=route_after_evaluation outcome=success
+[trajectory] run=<run-id> phase=question event=end termination=answered
+```
+
+These logs contain run IDs and control-flow summaries, but not question text,
+answers, feedback, credentials, or source content. PostgreSQL checkpoints remain
+the durable execution record; the log is an operator-friendly live view.
 
 PostgreSQL integration tests require `REGULATORY_TEST_DATABASE_URL` pointing
 to a dedicated database whose name contains `test`:

@@ -34,6 +34,7 @@ analyze-chunking = "regulatory_agent.chunking:main"
 regulatory-vector = "regulatory_agent.vector_db:main"
 regulatory-agent = "regulatory_agent.cli:main"
 regulatory-persistence = "regulatory_agent.persistence:main"
+regulatory-web = "regulatory_agent.gradio_interface:main"
 
 [build-system]
 requires = ["hatchling"]

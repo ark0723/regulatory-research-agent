@@ -22,6 +22,7 @@ regulatory_agent/
 │   ├── conversation_service.py # run-isolated application lifecycle
 │   ├── postgres_repository.py  # persistent application metadata
 │   ├── persistence.py      # storage/checkpointer composition
+│   ├── gradio_interface.py # PostgreSQL-backed Gradio web MVP
 │   ├── runtime.py          # model and existing-PGVector factories
 │   ├── cli.py              # package command-line composition
 │   └── paths.py            # repository-relative paths
@@ -54,8 +55,8 @@ uv run regulatory-vector query "What are the basic elements of informed consent?
 uv run regulatory-agent route "What are the eight basic elements of informed consent?"
 # Run selected agents and citation-validated final synthesis:
 uv run regulatory-agent research "What are the eight basic elements of informed consent?"
-uv run regulatory-persistence setup
-uv run regulatory-web --provider groq --model <groq-model-name>
+uv run --env-file .env regulatory-persistence setup
+uv run --env-file .env regulatory-web --provider groq --model <groq-model-name>
 uv run python -m unittest discover -s tests -p 'test_*.py'
 ```
 
@@ -106,7 +107,7 @@ PGVector tables and the `regulatory_chunks` collection are not migrated.
 Apply the versioned application migrations and LangGraph migrations explicitly:
 
 ```bash
-uv run regulatory-persistence setup
+uv run --env-file .env regulatory-persistence setup
 ```
 
 The setup account needs schema/table creation permission. A normal runtime
@@ -149,8 +150,8 @@ reconciler therefore prefers an explicit ambiguous failure over replay.
 Initialize the persistence schemas once, then launch the local-only web app:
 
 ```bash
-uv run regulatory-persistence setup
-uv run regulatory-web --provider groq --model <groq-model-name>
+uv run --env-file .env regulatory-persistence setup
+uv run --env-file .env regulatory-web --provider groq --model <groq-model-name>
 ```
 
 The server binds to `127.0.0.1:7860` and public sharing is disabled. It opens

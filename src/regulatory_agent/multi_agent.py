@@ -45,6 +45,12 @@ _CHECKPOINT_ALLOWED_TYPES = [
 ]
 
 
+def create_checkpoint_serializer() -> JsonPlusSerializer:
+    """Return the strict-msgpack-compatible serializer used by all backends."""
+
+    return JsonPlusSerializer(allowed_msgpack_modules=_CHECKPOINT_ALLOWED_TYPES)
+
+
 class SpecialistAgent(Protocol):
     """Structured specialist interface required by the parent graph."""
 
@@ -126,6 +132,9 @@ class SynthesisValidationResult(BaseModel):
     issues: list[SynthesisValidationIssue] = Field(default_factory=list)
 
 
+HumanReviewAction = Literal["approve", "revise", "research_again", "edit_question"]
+
+
 class HumanReviewRequest(BaseModel):
     """Payload surfaced when the graph pauses for a human decision."""
 
@@ -134,17 +143,41 @@ class HumanReviewRequest(BaseModel):
     citations: list[str] = Field(default_factory=list)
     evaluation: AnswerEvaluation | None = None
     reason: str
+    allowed_actions: list[HumanReviewAction] = Field(
+        default_factory=lambda: [
+            "approve",
+            "revise",
+            "research_again",
+            "edit_question",
+        ]
+    )
 
 
 class HumanReviewResponse(BaseModel):
     """Typed input expected when resuming an interrupted graph."""
 
     approved: bool
+    action: HumanReviewAction
     feedback: str = ""
 
+    @model_validator(mode="before")
+    @classmethod
+    def default_legacy_action(cls, value: Any) -> Any:
+        """Map the previous boolean-only API onto the explicit action model."""
+
+        if isinstance(value, dict) and "action" not in value:
+            normalized = dict(value)
+            normalized["action"] = (
+                "approve" if normalized.get("approved") else "edit_question"
+            )
+            return normalized
+        return value
+
     @model_validator(mode="after")
-    def rejection_requires_feedback(self) -> "HumanReviewResponse":
-        if not self.approved and not self.feedback.strip():
+    def validate_action(self) -> "HumanReviewResponse":
+        if self.approved != (self.action == "approve"):
+            raise ValueError("approved must agree with the selected review action")
+        if self.action != "approve" and not self.feedback.strip():
             raise ValueError("feedback is required when rejecting an answer")
         return self
 
@@ -260,6 +293,7 @@ class MultiAgentResearchResult(BaseModel):
     thread_id: str
     human_review_request: HumanReviewRequest | None = None
     human_review: HumanReviewRecord | None = None
+    human_review_history: list[HumanReviewRecord] = Field(default_factory=list)
     evaluation_retry_count: int = 0
     revision_count: int = 0
     research_retry_count: int = 0
@@ -284,6 +318,13 @@ class MultiAgentResearchResult(BaseModel):
     ]
 
 
+class PersistedThreadSnapshot(BaseModel):
+    """Latest durable graph view used by application-state reconciliation."""
+
+    checkpoint_id: str | None = None
+    result: MultiAgentResearchResult
+
+
 class MultiAgentState(TypedDict, total=False):
     """LangGraph state; parallel contributions are merged with list addition."""
 
@@ -306,6 +347,11 @@ class MultiAgentState(TypedDict, total=False):
     research_retry_executions: Annotated[list[ResearchQueryExecution], add]
     research_retry_diagnostics: list[ResearchRetryAttemptDiagnostic]
     human_review: HumanReviewRecord
+    human_review_history: list[HumanReviewRecord]
+    revision_feedback: str
+    revision_unsupported_claims: list[str]
+    revision_missing_information: list[str]
+    human_research_feedback: str
     evaluation_retry_count: int
     revision_count: int
     research_retry_count: int
@@ -321,6 +367,8 @@ class MultiAgentState(TypedDict, total=False):
         "retry_limit_reached",
         "evaluation_failed",
         "human_review_required",
+        "human_revision_in_progress",
+        "human_research_planning_in_progress",
         "revision_in_progress",
         "revision_failed",
         "research_planning_in_progress",
@@ -397,7 +445,7 @@ REVISION_PROMPT = ChatPromptTemplate.from_messages(
             """You revise an FDA regulatory answer using only existing evidence.
 
 ## Objective
-Correct the previous answer according to the supplied evaluation while keeping
+Correct the previous answer according to the supplied revision feedback while keeping
 all useful, supported content.
 
 ## Evidence and authority rules
@@ -428,8 +476,8 @@ Return the required FinalAnswerDraft structured output.""",
 ## Previous validated answer
 {previous_answer}
 
-## Evaluation feedback
-{evaluation_feedback}
+## Revision feedback
+{revision_feedback}
 
 ## Unsupported claims to remove or correct
 {unsupported_claims}
@@ -475,7 +523,7 @@ Return only the required ResearchRetryPlan structured output.""",
 ## Current answer
 {current_answer}
 
-## Evaluation feedback
+## Evaluation or human review feedback
 {evaluation_feedback}
 
 ## Missing information
@@ -809,9 +857,7 @@ class RegulatoryMultiAgent:
             )
         self.available_research_targets = selected_targets
         self.checkpointer = checkpointer or InMemorySaver(
-            serde=JsonPlusSerializer(
-                allowed_msgpack_modules=_CHECKPOINT_ALLOWED_TYPES
-            )
+            serde=create_checkpoint_serializer()
         )
         self.graph = self._compile_graph()
 
@@ -1072,7 +1118,19 @@ class RegulatoryMultiAgent:
         """Generate a structured research plan without invoking any specialist."""
 
         evaluation = state.get("evaluation")
-        if evaluation is None or evaluation.decision != "research_again":
+        human_requested = (
+            state.get("termination_reason") == "human_research_planning_in_progress"
+        )
+        human_feedback = state.get("human_research_feedback", "").strip()
+        if human_requested:
+            evaluation_feedback = human_feedback
+            missing_information = [human_feedback] if human_feedback else []
+            unsupported_claims: list[str] = []
+        elif evaluation is not None and evaluation.decision == "research_again":
+            evaluation_feedback = evaluation.brief_evaluation.strip()
+            missing_information = evaluation.missing_information
+            unsupported_claims = evaluation.unsupported_claims
+        else:
             error = "Research retry planning requires a research_again evaluation."
             return {
                 "research_retry_error": error,
@@ -1081,7 +1139,7 @@ class RegulatoryMultiAgent:
                 ),
                 "termination_reason": "research_retry_planning_failed",
             }
-        if not evaluation.brief_evaluation.strip():
+        if not evaluation_feedback:
             error = "Research retry planning requires evaluation feedback."
             return {
                 "research_retry_error": error,
@@ -1095,13 +1153,13 @@ class RegulatoryMultiAgent:
             {
                 "question": state["question"],
                 "current_answer": state.get("final_answer", ""),
-                "evaluation_feedback": evaluation.brief_evaluation,
+                "evaluation_feedback": evaluation_feedback,
                 "missing_information": (
-                    "\n".join(f"- {item}" for item in evaluation.missing_information)
+                    "\n".join(f"- {item}" for item in missing_information)
                     or "None"
                 ),
                 "unsupported_claims": (
-                    "\n".join(f"- {item}" for item in evaluation.unsupported_claims)
+                    "\n".join(f"- {item}" for item in unsupported_claims)
                     or "None"
                 ),
                 "evidence_coverage": self._research_coverage(state),
@@ -1419,11 +1477,20 @@ class RegulatoryMultiAgent:
         """Produce a structured revision from existing evidence and feedback only."""
 
         evaluation = state.get("evaluation")
+        revision_feedback = state.get("revision_feedback", "").strip()
+        if not revision_feedback and evaluation is not None:
+            revision_feedback = evaluation.brief_evaluation.strip()
+        unsupported_claims = state.get("revision_unsupported_claims")
+        if unsupported_claims is None:
+            unsupported_claims = evaluation.unsupported_claims if evaluation else []
+        missing_information = state.get("revision_missing_information")
+        if missing_information is None:
+            missing_information = evaluation.missing_information if evaluation else []
         previous_answer = state.get("final_answer", "").strip()
         sources = state.get("sources", [])
-        if evaluation is None or not evaluation.brief_evaluation.strip():
+        if not revision_feedback:
             return {
-                "revision_error": "Revision requires evaluation feedback.",
+                "revision_error": "Revision requires evaluation or human feedback.",
                 "termination_reason": "revision_failed",
             }
         if not previous_answer:
@@ -1441,13 +1508,13 @@ class RegulatoryMultiAgent:
             {
                 "question": state["question"],
                 "previous_answer": previous_answer,
-                "evaluation_feedback": evaluation.brief_evaluation,
+                "revision_feedback": revision_feedback,
                 "unsupported_claims": (
-                    "\n".join(f"- {item}" for item in evaluation.unsupported_claims)
+                    "\n".join(f"- {item}" for item in unsupported_claims)
                     or "None"
                 ),
                 "missing_information": (
-                    "\n".join(f"- {item}" for item in evaluation.missing_information)
+                    "\n".join(f"- {item}" for item in missing_information)
                     or "None"
                 ),
                 "sources": _render_sources(sources),
@@ -1681,6 +1748,9 @@ class RegulatoryMultiAgent:
                     **self._finalize_retry_diagnostic(state, "revision_started"),
                     "evaluation_retry_count": next_total,
                     "revision_count": next_revision,
+                    "revision_feedback": evaluation.brief_evaluation,
+                    "revision_unsupported_claims": evaluation.unsupported_claims,
+                    "revision_missing_information": evaluation.missing_information,
                     "evaluation_history": [
                         *state.get("evaluation_history", []),
                         entry,
@@ -1699,6 +1769,70 @@ class RegulatoryMultiAgent:
                 "evaluation_history": [*state.get("evaluation_history", []), entry],
                 "research_retry_error": None,
                 "termination_reason": "research_planning_in_progress",
+            },
+            goto="prepare_research_retry",
+        )
+
+    def handle_human_review(self, state: MultiAgentState) -> Command:
+        """Route one persisted human action without repeating broad research."""
+
+        review = state.get("human_review")
+        if review is None:
+            return Command(
+                update={"termination_reason": "human_review_required"},
+                goto=END,
+            )
+        if review.action in {"approve", "edit_question"}:
+            return Command(goto=END)
+
+        if review.action == "revise":
+            if self._retry_limit_reached(state, "revise"):
+                return Command(
+                    update={"termination_reason": "retry_limit_reached"},
+                    goto=END,
+                )
+            next_total = state.get("evaluation_retry_count", 0) + 1
+            next_revision = state.get("revision_count", 0) + 1
+            unvalidated = SynthesisValidationResult(
+                valid=False,
+                issues=[
+                    SynthesisValidationIssue(
+                        code="human_revision_not_validated",
+                        message=(
+                            "The human-requested revision has not passed "
+                            "citation validation."
+                        ),
+                    )
+                ],
+            )
+            return Command(
+                update={
+                    "evaluation": None,
+                    "evaluation_error": None,
+                    "evaluation_retry_count": next_total,
+                    "revision_count": next_revision,
+                    "revision_feedback": review.feedback,
+                    "revision_unsupported_claims": [],
+                    "revision_missing_information": [],
+                    "validation": unvalidated,
+                    "revision_error": "",
+                    "termination_reason": "revision_in_progress",
+                },
+                goto="revise_answer",
+            )
+
+        if self._retry_limit_reached(state, "research_again"):
+            return Command(
+                update={"termination_reason": "retry_limit_reached"},
+                goto=END,
+            )
+        return Command(
+            update={
+                "evaluation": None,
+                "evaluation_error": None,
+                "human_research_feedback": review.feedback,
+                "research_retry_error": None,
+                "termination_reason": "human_research_planning_in_progress",
             },
             goto="prepare_research_retry",
         )
@@ -1728,6 +1862,10 @@ class RegulatoryMultiAgent:
         review = HumanReviewRecord(**response.model_dump())
         return {
             "human_review": review,
+            "human_review_history": [
+                *state.get("human_review_history", []),
+                review,
+            ],
             "termination_reason": (
                 "human_approved" if review.approved else "human_rejected"
             ),
@@ -1759,6 +1897,11 @@ class RegulatoryMultiAgent:
         workflow.add_node("merge_research_evidence", self.merge_research_evidence)
         workflow.add_node("regenerate_answer", self.regenerate_answer)
         workflow.add_node("human_review", self.human_review)
+        workflow.add_node(
+            "handle_human_review",
+            self.handle_human_review,
+            destinations=("revise_answer", "prepare_research_retry", END),
+        )
         workflow.add_edge(START, "route_question")
         workflow.add_conditional_edges(
             "route_question",
@@ -1780,7 +1923,7 @@ class RegulatoryMultiAgent:
         workflow.add_edge("execute_research_query", "merge_research_evidence")
         workflow.add_edge("merge_research_evidence", "regenerate_answer")
         workflow.add_edge("regenerate_answer", "evaluate_answer")
-        workflow.add_edge("human_review", END)
+        workflow.add_edge("human_review", "handle_human_review")
         return workflow.compile(checkpointer=self.checkpointer)
 
     def _result_from_state(
@@ -1818,6 +1961,7 @@ class RegulatoryMultiAgent:
             thread_id=thread_id,
             human_review_request=review_request,
             human_review=state.get("human_review"),
+            human_review_history=state.get("human_review_history", []),
             evaluation_retry_count=state.get("evaluation_retry_count", 0),
             revision_count=state.get("revision_count", 0),
             research_retry_count=state.get("research_retry_count", 0),
@@ -1843,6 +1987,7 @@ class RegulatoryMultiAgent:
                 "research_retry_contributions": [],
                 "research_retry_executions": [],
                 "research_retry_diagnostics": [],
+                "human_review_history": [],
                 "evaluation_history": [],
             },
             config=config,
@@ -1853,20 +1998,52 @@ class RegulatoryMultiAgent:
         self,
         *,
         thread_id: str,
-        approved: bool,
+        approved: bool | None = None,
         feedback: str = "",
+        action: HumanReviewAction | None = None,
     ) -> MultiAgentResearchResult:
         """Resume a paused review using the same persisted thread ID."""
 
         if not thread_id.strip():
             raise ValueError("thread_id must not be empty")
-        response = HumanReviewResponse(approved=approved, feedback=feedback)
+        if approved is None and action is None:
+            raise ValueError("provide approved or an explicit review action")
+        selected_action = action or ("approve" if approved else "edit_question")
+        selected_approval = (
+            approved if approved is not None else selected_action == "approve"
+        )
+        response = HumanReviewResponse(
+            approved=selected_approval,
+            action=selected_action,
+            feedback=feedback,
+        )
         config = {"configurable": {"thread_id": thread_id}}
         state = self.graph.invoke(
             Command(resume=response.model_dump()),
             config=config,
         )
         return self._result_from_state(state, thread_id=thread_id)
+
+    def inspect_thread(self, *, thread_id: str) -> PersistedThreadSnapshot | None:
+        """Read the latest checkpoint without advancing or replaying the graph."""
+
+        if not thread_id.strip():
+            raise ValueError("thread_id must not be empty")
+        snapshot = self.graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        if not snapshot.values:
+            return None
+        state = dict(snapshot.values)
+        if snapshot.interrupts:
+            state["__interrupt__"] = list(snapshot.interrupts)
+        checkpoint_id = snapshot.config.get("configurable", {}).get(
+            "checkpoint_id"
+        )
+        return PersistedThreadSnapshot(
+            checkpoint_id=checkpoint_id,
+            result=self._result_from_state(state, thread_id=thread_id),
+        )
 
     def mermaid(self) -> str:
         """Return the compiled parent graph as Mermaid source."""

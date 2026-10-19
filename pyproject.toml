@@ -15,6 +15,7 @@ dependencies = [
     "langchain-tavily>=0.2.18",
     "langchain-text-splitters>=1.1.3",
     "langgraph>=1.2.15",
+    "langgraph-checkpoint-postgres>=3.2.0",
     "ollama>=0.6.3",
     "psycopg[binary]>=3.3.6",
     "pymupdf>=1.28.2",
@@ -32,6 +33,7 @@ build-regulatory-documents = "regulatory_agent.documents:main"
 analyze-chunking = "regulatory_agent.chunking:main"
 regulatory-vector = "regulatory_agent.vector_db:main"
 regulatory-agent = "regulatory_agent.cli:main"
+regulatory-persistence = "regulatory_agent.persistence:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -39,4 +41,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/regulatory_agent"]
-

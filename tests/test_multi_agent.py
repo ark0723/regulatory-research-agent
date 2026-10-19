@@ -1448,6 +1448,13 @@ class MultiAgentTests(unittest.TestCase):
                 thread_id=paused.thread_id,
                 approved=False,
             )
+        with self.assertRaisesRegex(ValueError, "must agree"):
+            agent.resume_human_review(
+                thread_id=paused.thread_id,
+                approved=True,
+                action="revise",
+                feedback="Revise it.",
+            )
         resumed = agent.resume_human_review(
             thread_id=paused.thread_id,
             approved=False,
@@ -1455,9 +1462,140 @@ class MultiAgentTests(unittest.TestCase):
         )
 
         self.assertEqual("human_rejected", resumed.termination_reason)
+        self.assertEqual("edit_question", resumed.human_review.action)
+        self.assertEqual(1, len(resumed.human_review_history))
         self.assertEqual(
             "The factual premise is incorrect.", resumed.human_review.feedback
         )
+
+    def test_human_rejection_can_request_grounded_revision(self):
+        review_required = passing_evaluation().model_copy(
+            update={
+                "decision": "human_review",
+                "brief_evaluation": "A human must confirm the presentation.",
+            }
+        )
+        evaluator = FakeEvaluator(
+            evaluation=[review_required, passing_evaluation()]
+        )
+        agent, llm, regulation, guidance, web = build_agent(
+            targets=("regulation",),
+            drafts=[
+                FinalAnswerDraft(answer="Initial. [[S1]]", cited_source_ids=["S1"]),
+                FinalAnswerDraft(
+                    answer="Human-feedback revision. [[S1]]",
+                    cited_source_ids=["S1"],
+                ),
+            ],
+            evaluator=evaluator,
+        )
+        paused = agent.ask("Does this apply?", thread_id="human-revise")
+
+        resumed = agent.resume_human_review(
+            thread_id=paused.thread_id,
+            action="revise",
+            feedback="State the limitation before the conclusion.",
+        )
+
+        self.assertEqual("answered", resumed.termination_reason)
+        self.assertEqual("revise", resumed.human_review.action)
+        self.assertEqual(1, resumed.evaluation_retry_count)
+        self.assertEqual(1, resumed.revision_count)
+        self.assertEqual(0, resumed.research_retry_count)
+        self.assertTrue(resumed.validation.valid)
+        self.assertEqual(1, len(regulation.calls))
+        self.assertEqual([], guidance.calls)
+        self.assertEqual([], web.calls)
+        self.assertEqual(2, len(evaluator.calls))
+        self.assertIn(
+            "State the limitation before the conclusion.",
+            llm.invoker.calls[1].to_string(),
+        )
+
+    def test_human_rejection_can_request_selective_research_retry(self):
+        review_required = passing_evaluation().model_copy(
+            update={
+                "decision": "human_review",
+                "brief_evaluation": "A human must decide whether more evidence is needed.",
+            }
+        )
+        plan = ResearchRetryPlan(
+            evidence_gaps=["Implementation recommendation"],
+            queries=[
+                TargetedResearchQuery(
+                    target="guidance",
+                    query="FDA implementation recommendation",
+                    reason="The reviewer requested additional guidance support.",
+                )
+            ],
+        )
+        evaluator = FakeEvaluator(
+            evaluation=[review_required, passing_evaluation()]
+        )
+        agent, llm, regulation, guidance, web = build_agent(
+            targets=("regulation",),
+            drafts=[
+                FinalAnswerDraft(answer="Initial. [[S1]]", cited_source_ids=["S1"]),
+                plan,
+                FinalAnswerDraft(
+                    answer="Rule. [[S1]] Recommendation. [[S2]]",
+                    cited_source_ids=["S1", "S2"],
+                ),
+            ],
+            evaluator=evaluator,
+        )
+        paused = agent.ask("What is required?", thread_id="human-research")
+
+        resumed = agent.resume_human_review(
+            thread_id=paused.thread_id,
+            action="research_again",
+            feedback="Find FDA guidance on practical implementation.",
+        )
+
+        self.assertEqual("answered", resumed.termination_reason)
+        self.assertEqual("research_again", resumed.human_review.action)
+        self.assertEqual(1, resumed.evaluation_retry_count)
+        self.assertEqual(0, resumed.revision_count)
+        self.assertEqual(1, resumed.research_retry_count)
+        self.assertEqual(1, len(regulation.calls))
+        self.assertEqual(["FDA implementation recommendation"], guidance.calls)
+        self.assertEqual([], web.calls)
+        self.assertEqual(1, len(resumed.research_retry_diagnostics))
+        self.assertEqual(
+            "evaluation_passed", resumed.research_retry_diagnostics[0].outcome
+        )
+        self.assertIn(
+            "Find FDA guidance on practical implementation.",
+            llm.invoker.calls[1].to_string(),
+        )
+
+    def test_human_requested_retry_respects_existing_budget(self):
+        review_required = passing_evaluation().model_copy(
+            update={"decision": "human_review"}
+        )
+        agent, llm, regulation, guidance, web = build_agent(
+            targets=("regulation",),
+            drafts=[
+                FinalAnswerDraft(answer="Initial. [[S1]]", cited_source_ids=["S1"]),
+            ],
+            evaluator=FakeEvaluator(evaluation=review_required),
+            retry_policy=EvaluationRetryPolicy(max_research_retries=0),
+        )
+        paused = agent.ask("What is required?", thread_id="human-research-limit")
+
+        resumed = agent.resume_human_review(
+            thread_id=paused.thread_id,
+            action="research_again",
+            feedback="Find more guidance.",
+        )
+
+        self.assertEqual("retry_limit_reached", resumed.termination_reason)
+        self.assertEqual(0, resumed.evaluation_retry_count)
+        self.assertEqual(0, resumed.research_retry_count)
+        self.assertEqual(1, len(llm.invoker.calls))
+        self.assertEqual(1, len(regulation.calls))
+        self.assertEqual([], guidance.calls)
+        self.assertEqual([], web.calls)
 
     def test_always_policy_pauses_even_when_evaluator_passes(self):
         agent, _, _, _, _ = build_agent(
@@ -1522,6 +1660,7 @@ class MultiAgentTests(unittest.TestCase):
             "merge_research_evidence",
             "regenerate_answer",
             "human_review",
+            "handle_human_review",
         ):
             self.assertIn(node, mermaid)
 

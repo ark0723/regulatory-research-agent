@@ -222,13 +222,13 @@ The parent graph now supports checkpointed human approval through LangGraph
 `interrupt()` and `Command(resume=...)`. By default, it pauses only for an
 evaluation decision of `human_review`; callers can instead choose `always` or
 `never`. The interrupt exposes a typed request containing the answer,
-citations, evaluation, and reason. Approval and rejection are persisted in the
-state, and rejection requires written feedback.
-
-The current rejection path ends with `human_rejected`. It intentionally does
-not jump directly back to routing because an unchanged question and unchanged
-evidence would repeat the same answer. Parent-level retry coordination that
-consumes human feedback remains a future layer.
+citations, evaluation, reason, and allowed actions. Approval and rejection are
+persisted in a compact human-review history, and every rejection requires
+written feedback. `revise` performs a citation-validated revision using the
+existing source catalog; `research_again` sends the feedback through the
+existing bounded Phase 3B plan and execution path; `edit_question` ends the
+current run so the UI can collect a new question. A rejection never jumps
+directly back to broad question routing.
 
 ## 11. Development Ownership
 

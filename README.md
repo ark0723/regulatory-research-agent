@@ -19,6 +19,9 @@ regulatory_agent/
 │   ├── routing.py          # structured multi-label question routing
 │   ├── multi_agent.py      # explicit source nodes and final synthesis
 │   ├── evaluation.py       # tool-assisted structured answer review
+│   ├── conversation_service.py # run-isolated application lifecycle
+│   ├── postgres_repository.py  # persistent application metadata
+│   ├── persistence.py      # storage/checkpointer composition
 │   ├── runtime.py          # model and existing-PGVector factories
 │   ├── cli.py              # package command-line composition
 │   └── paths.py            # repository-relative paths
@@ -51,6 +54,7 @@ uv run regulatory-vector query "What are the basic elements of informed consent?
 uv run regulatory-agent route "What are the eight basic elements of informed consent?"
 # Run selected agents and citation-validated final synthesis:
 uv run regulatory-agent research "What are the eight basic elements of informed consent?"
+uv run regulatory-persistence setup
 uv run python -m unittest discover -s tests -p 'test_*.py'
 ```
 
@@ -89,6 +93,64 @@ The existing database variables (`POSTGRES_HOST`, `POSTGRES_PORT`,
 `OLLAMA_BASE_URL` only when Ollama is not available at its default local URL.
 The `regulatory_chunks` collection must already be populated with
 `uv run regulatory-vector index`; the agent never reindexes it automatically.
+
+## Persistent conversation service
+
+Phase 4B stores user-visible metadata and LangGraph checkpoints in separate
+PostgreSQL schemas. `regulatory_app` contains conversations, runs, messages,
+human-review actions, and idempotency receipts. `regulatory_checkpoint`
+contains only official LangGraph `PostgresSaver` tables. Existing public
+PGVector tables and the `regulatory_chunks` collection are not migrated.
+
+Apply the versioned application migrations and LangGraph migrations explicitly:
+
+```bash
+uv run regulatory-persistence setup
+```
+
+The setup account needs schema/table creation permission. A normal runtime
+account needs DML access to both schemas and its existing read access to the
+vector corpus. PostgreSQL mode fails closed if either schema is unavailable;
+it never falls back to an in-memory checkpointer.
+
+```python
+from regulatory_agent.persistence import open_conversation_service
+
+with open_conversation_service(
+    storage_mode="postgres",
+    provider="groq",
+    model="<model-name>",
+) as service:
+    conversation = service.create_conversation()
+    run = service.start_run(conversation.conversation_id, "Question")
+```
+
+Use `storage_mode="memory"` for deterministic tests and process-local
+development. Set `REGULATORY_STORAGE_MODE=postgres` for the persistent MVP.
+`REGULATORY_APP_DATABASE_URL` may provide a complete psycopg URI; otherwise
+the existing `POSTGRES_*` values are used. Keep the context manager open for
+the service lifetime because it owns both connection pools.
+
+Human-review submissions use a short database claim. The transaction ends
+before graph resume, search, or model calls. A second worker cannot resume the
+same request concurrently. `ConversationService.reconcile_run()` compares an
+expired claim with the latest checkpoint. It releases the claim only when the
+checkpoint demonstrably did not advance, or projects the advanced checkpoint
+into application metadata. Missing or inconsistent checkpoints become visible
+failed runs and never trigger automatic research replay.
+
+Exactly-once external model/tool execution cannot be guaranteed across a
+process crash: an external call may finish before the next checkpoint. The
+reconciler therefore prefers an explicit ambiguous failure over replay.
+
+PostgreSQL integration tests require `REGULATORY_TEST_DATABASE_URL` pointing
+to a dedicated database whose name contains `test`:
+
+```bash
+REGULATORY_TEST_DATABASE_URL=postgresql://.../regulatory_agent_test \
+  LANGGRAPH_STRICT_MSGPACK=true \
+  uv run python -m unittest tests.test_postgres_persistence -v
+```
 
 The provider and model can also be selected for one invocation:
 
@@ -433,7 +495,7 @@ if result.termination_reason == "awaiting_human_review":
 
     result = agent.resume_human_review(
         thread_id=result.thread_id,
-        approved=True,
+        action="approve",
         feedback="Applicability facts were confirmed.",
     )
 
@@ -450,7 +512,34 @@ Available policies are:
 The default in-memory checkpointer supports a single running Python process.
 Applications that need resume after a process restart should inject a durable
 LangGraph checkpointer through `create_multi_agent(checkpointer=...)`. A rejected
-answer ends as `human_rejected` and retains mandatory reviewer feedback; it does
-not blindly repeat the same routing and retrieval cycle.
+answer requires feedback and an explicit next action:
+
+```python
+# Revise only from the existing evidence catalog.
+result = agent.resume_human_review(
+    thread_id=result.thread_id,
+    action="revise",
+    feedback="State the applicability limitation before the conclusion.",
+)
+
+# Or execute a bounded, targeted Phase 3B research retry.
+result = agent.resume_human_review(
+    thread_id=result.thread_id,
+    action="research_again",
+    feedback="Find FDA guidance addressing electronic consent implementation.",
+)
+
+# End this run and let the UI collect a replacement question.
+result = agent.resume_human_review(
+    thread_id=result.thread_id,
+    action="edit_question",
+    feedback="The original question omitted the device-study context.",
+)
+```
+
+The older `approved=True/False` API remains supported: `True` maps to `approve`
+and `False` maps to `edit_question`. Human-requested revision and research use
+the same retry budgets as evaluator-requested attempts. They do not rerun broad
+question routing.
 
 All commands resolve data paths from the repository location, so they do not depend on the shell's current working directory.

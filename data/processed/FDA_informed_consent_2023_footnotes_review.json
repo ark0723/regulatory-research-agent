@@ -1,0 +1,14 @@
+{
+  "document_id": "fda-informed-consent-2023",
+  "source_file": "FDA_informed_consent_2023.pdf",
+  "source_sha256": "96b26b2edb06e20ee2872ca59f4ec7c04cde8a8b1adf98bc150764e3d52f906a",
+  "unresolved_footnotes": [
+    {
+      "number": "1",
+      "text": "This guidance document was developed by the Office of Clinical Policy (OCLiP), in coordination with the Center for Biologics Evaluation and Research (CBER), the Center for Devices and Radiological Health (CDRH), and the Center for Drug Evaluation and Research (CDER).",
+      "pdf_page": 6,
+      "reason": "reference_not_detected",
+      "candidate_section_ids": []
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+[project]
+name = "regulatory-agent"
+version = "0.1.0"
+description = "Evidence-grounded FDA regulatory RAG system built with LangChain and LangGraph"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "gradio>=6.30.0",
+    "langchain>=1.4.6",
+    "langchain-groq>=1.1.3",
+    "langchain-ollama>=1.1.0",
+    "langchain-openai>=1.7.2",
+    "langchain-postgres>=0.0.19",
+    "langchain-tavily>=0.2.18",
+    "langchain-text-splitters>=1.1.3",
+    "langgraph>=1.2.15",
+    "ollama>=0.6.3",
+    "psycopg[binary]>=3.3.6",
+    "pymupdf>=1.28.2",
+    "pypdf>=6.21.0",
+    "python-dotenv>=1.2.4",
+    "sentence-transformers>=6.1.0",
+    "sqlalchemy>=2.1.4",
+]
+
+[project.scripts]
+extract-cfr = "regulatory_agent.ingestion.cfr_extract:main"
+normalize-cfr = "regulatory_agent.ingestion.cfr_normalize:normalize_part"
+normalize-fda-guidance = "regulatory_agent.ingestion.fda_guidance:main"
+build-regulatory-documents = "regulatory_agent.documents:main"
+analyze-chunking = "regulatory_agent.chunking:main"
+regulatory-vector = "regulatory_agent.vector_db:main"
+regulatory-agent = "regulatory_agent.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/regulatory_agent"]
+

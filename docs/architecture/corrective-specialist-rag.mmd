@@ -1,0 +1,21 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+    START([START]):::first
+    retrieve[retrieve]
+    extract_and_evaluate[extract_and_evaluate]
+    rewrite_query[rewrite_query]
+    generate_answer[generate_answer]
+    END([END]):::last
+    START --> retrieve
+    retrieve --> extract_and_evaluate
+    extract_and_evaluate -. insufficient and retry remains .-> rewrite_query
+    extract_and_evaluate -. sufficient or retry exhausted .-> generate_answer
+    rewrite_query --> retrieve
+    generate_answer --> END
+    classDef default fill:#f2f0ff,line-height:1.2
+    classDef first fill-opacity:0
+    classDef last fill:#bfb6fc

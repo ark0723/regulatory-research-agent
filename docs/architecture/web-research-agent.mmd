@@ -1,0 +1,20 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+    __start__([<p>__start__</p>]):::first
+    search_web(search_web)
+    rerank_search_results(rerank_search_results)
+    extract_selected_pages(extract_selected_pages)
+    rerank_extracted_evidence(rerank_extracted_evidence)
+    __end__([<p>__end__</p>]):::last
+    __start__ --> search_web;
+    search_web --> rerank_search_results;
+    rerank_search_results --> extract_selected_pages;
+    extract_selected_pages --> rerank_extracted_evidence;
+    rerank_extracted_evidence --> __end__;
+    classDef default fill:#f2f0ff,line-height:1.2
+    classDef first fill-opacity:0
+    classDef last fill:#bfb6fc

@@ -1,0 +1,48 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+    __start__([__start__]):::first
+    route_question(route_question)
+    regulation_agent(regulation_agent)
+    guidance_agent(guidance_agent)
+    web_agent(web_agent)
+    generate_answer(generate_answer)
+    evaluate_answer(evaluate_answer)
+    route_after_evaluation(route_after_evaluation)
+    revise_answer(revise_answer)
+    validate_revision(validate_revision)
+    prepare_research_retry(prepare_research_retry)
+    validate_retry_plan(validate_retry_plan)
+    execute_research_query(execute_research_query)
+    merge_research_evidence(merge_research_evidence)
+    regenerate_answer(regenerate_answer)
+    human_review(human_review)
+    __end__([__end__]):::last
+    __start__ --> route_question
+    route_question -.-> regulation_agent
+    route_question -.-> guidance_agent
+    route_question -.-> web_agent
+    regulation_agent --> generate_answer
+    guidance_agent --> generate_answer
+    web_agent --> generate_answer
+    generate_answer --> evaluate_answer
+    evaluate_answer --> route_after_evaluation
+    route_after_evaluation -. revise .-> revise_answer
+    revise_answer --> validate_revision
+    validate_revision --> evaluate_answer
+    route_after_evaluation -. research_again .-> prepare_research_retry
+    prepare_research_retry --> validate_retry_plan
+    validate_retry_plan -. valid query plan .-> execute_research_query
+    validate_retry_plan -. invalid or limit .-> __end__
+    execute_research_query --> merge_research_evidence
+    merge_research_evidence --> regenerate_answer
+    regenerate_answer --> evaluate_answer
+    route_after_evaluation -. pass, limit, or failure .-> __end__
+    route_after_evaluation -. approval required .-> human_review
+    human_review --> __end__
+    classDef default fill:#f2f0ff,line-height:1.2
+    classDef first fill-opacity:0
+    classDef last fill:#bfb6fc
